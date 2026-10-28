@@ -11,6 +11,15 @@ pipeline {
     // ==============================================================================
     parameters {
         // --------------------------------------------------------------------------
+        // 0. JENKINS SECRET FILE CREDENTIAL (.env)
+        // --------------------------------------------------------------------------
+        string(
+            name: 'ENV_CREDENTIAL_ID',
+            defaultValue: 'app-env-file',
+            description: 'Jenkins Secret File Credential ID containing .env (Leave blank if not using Secret File)'
+        )
+
+        // --------------------------------------------------------------------------
         // 1. LINUX DEPLOYMENT SERVER PARAMETERS (Overrides .env if specified)
         // --------------------------------------------------------------------------
         string(
@@ -64,6 +73,18 @@ pipeline {
         )
     }
 
+    // ==============================================================================
+    // [BEST PRACTICE] PIPELINE CONTROLS & RESOURCE GUARDS
+    // ==============================================================================
+    options {
+        // Keep only the last 10 builds to save Jenkins storage
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // Abort pipeline if any step or SSH connection hangs over 30 minutes
+        timeout(time: 30, unit: 'MINUTES')
+        // Prevent simultaneous deployments from conflicting on the remote server
+        disableConcurrentBuilds()
+    }
+
     environment {
         // Application / Container Settings
         IMAGE_NAME         = 'simple-next-app'
@@ -82,7 +103,20 @@ pipeline {
         stage('Load Environment Config (.env)') {
             steps {
                 script {
-                    // Check if local .env file exists in the workspace
+                    // 1. Try to fetch .env from Jenkins Secret File credential
+                    def credId = (params.ENV_CREDENTIAL_ID?.trim()) ? params.ENV_CREDENTIAL_ID.trim() : 'app-env-file-web'
+                    try {
+                        withCredentials([file(credentialsId: credId, variable: 'SECRET_ENV_FILE')]) {
+                            if (fileExists(SECRET_ENV_FILE)) {
+                                echo "--> [SECRET FILE] Injected .env from Jenkins Credential ID: '${credId}'"
+                                sh "cp '${SECRET_ENV_FILE}' .env"
+                            }
+                        }
+                    } catch (Exception e) {
+                        echo "--> [NOTICE] Jenkins Secret File '${credId}' not found in Credential store. Checking workspace or parameters..."
+                    }
+
+                    // 2. Check if local .env file exists in the workspace
                     if (fileExists('.env')) {
                         echo "--> Found .env file in workspace. Loading server credentials..."
                         def envFileContent = readFile('.env')
@@ -248,19 +282,31 @@ pipeline {
             }
         }
 
-        stage('Verify Remote Container') {
+        stage('Verify Remote Container & Health Check') {
             steps {
                 echo "=========================================="
-                echo "Verifying container status on remote server"
+                echo "Verifying container status and HTTP response"
                 echo "=========================================="
                 sh """
                     SSH_CMD="sshpass -p '${TARGET_PASS}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${TARGET_PORT}"
                     
-                    echo "Checking container status:"
+                    echo "1. Checking container running status:"
                     \$SSH_CMD ${TARGET_USER}@${TARGET_IP} "docker ps --filter 'name=${CONTAINER_NAME}' --format 'table {{.ID}}\\t{{.Names}}\\t{{.Status}}\\t{{.Ports}}'"
                     
-                    echo "Checking recent container logs:"
-                    \$SSH_CMD ${TARGET_USER}@${TARGET_IP} "docker logs --tail 20 ${CONTAINER_NAME}"
+                    echo "2. Polling HTTP health check on port ${TARGET_APP_PORT} (up to 30 seconds)..."
+                    \$SSH_CMD ${TARGET_USER}@${TARGET_IP} "
+                        for i in \$(seq 1 15); do
+                            HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${TARGET_APP_PORT} || true)
+                            if [ \"\$HTTP_CODE\" = \"200\" ] || [ \"\$HTTP_CODE\" = \"304\" ]; then
+                                echo \"--> [HEALTH CHECK PASSED] App responded with HTTP \$HTTP_CODE\"
+                                exit 0
+                            fi
+                            echo \"Waiting for application to start... (attempt \$i/15, status: \$HTTP_CODE)\"
+                            sleep 2
+                        done
+                        echo \"--> [WARNING] Health check probe timed out. Displaying last 30 container logs:\"
+                        docker logs --tail 30 ${CONTAINER_NAME}
+                    "
                 """
             }
         }
@@ -268,12 +314,12 @@ pipeline {
 
     post {
         always {
-            echo "Cleaning up local image archive..."
-            sh "rm -f ${IMAGE_ARCHIVE} || true"
+            echo "--> [CLEANUP] Cleaning temporary image archives and workspace secrets..."
+            sh "rm -f ${IMAGE_ARCHIVE} .env || true"
         }
         success {
             echo "=========================================================================="
-            echo "SUCCESS: App successfully deployed to http://${TARGET_IP}:${TARGET_APP_PORT}"
+            echo "SUCCESS: App successfully deployed & verified at http://${TARGET_IP}:${TARGET_APP_PORT}"
             echo "=========================================================================="
         }
         failure {
