@@ -132,10 +132,9 @@ pipeline {
                                     val = val.substring(1, val.length() - 1)
                                 }
                                 dotenv[key] = val
-                                env[key] = val
                             }
                         }
-                        echo "--> Loaded ${dotenv.size()} configuration keys from .env: ${dotenv.keySet().join(', ')}"
+                        echo "--> Loaded ${dotenv.size()} configuration keys from .env: ${dotenv.keySet()}"
                     } else {
                         echo "--> Notice: No .env file found in workspace. Using parameters/environment."
                     }
@@ -165,7 +164,7 @@ pipeline {
                     
                     def enableSonarParam = params.ENABLE_SONAR_SCAN != null ? params.ENABLE_SONAR_SCAN : true
                     def dotenvSonar = dotenv['ENABLE_SONAR_SCAN'] != null ? dotenv['ENABLE_SONAR_SCAN'] : env.ENABLE_SONAR_SCAN
-                    env.SHOULD_SCAN_SONAR  = (dotenvSonar != null ? dotenvSonar.toString().toBoolean() : enableSonarParam).toString()
+                    env.SHOULD_SCAN_SONAR  = (dotenvSonar != null ? dotenvSonar.toString().trim().equalsIgnoreCase('true') : Boolean.valueOf(enableSonarParam.toString())).toString()
 
                     // Validate that deployment targets are available
                     if (!env.TARGET_IP || !env.TARGET_USER || !env.TARGET_PASS) {
