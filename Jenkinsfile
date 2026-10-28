@@ -192,25 +192,44 @@ pipeline {
                 echo "Project Key      : ${TARGET_SONAR_KEY}"
                 echo "=========================================="
                 sh """
-                    # 1. If sonar-scanner is installed on the Jenkins agent, use it
-                    if command -v sonar-scanner >/dev/null 2>&1; then
-                        echo "Using local sonar-scanner CLI..."
-                        sonar-scanner \\
-                            -Dsonar.host.url="${TARGET_SONAR_HOST}" \\
-                            -Dsonar.token="${TARGET_SONAR_TOKEN}" \\
-                            -Dsonar.projectKey="${TARGET_SONAR_KEY}"
-                    else
-                        # 2. Otherwise run official SonarSource Docker CLI (no local installation required!)
-                        echo "Local sonar-scanner CLI not found. Running via Docker (sonarsource/sonar-scanner-cli)..."
-                        docker run --rm \\
-                            -e SONAR_HOST_URL="${TARGET_SONAR_HOST}" \\
-                            -e SONAR_TOKEN="${TARGET_SONAR_TOKEN}" \\
-                            -v "\$(pwd):/usr/src" \\
-                            sonarsource/sonar-scanner-cli \\
-                            -Dsonar.host.url="${TARGET_SONAR_HOST}" \\
-                            -Dsonar.token="${TARGET_SONAR_TOKEN}" \\
-                            -Dsonar.projectKey="${TARGET_SONAR_KEY}"
+                    set -e
+                    TOOLS_DIR="\$HOME/.local"
+                    mkdir -p "\$TOOLS_DIR/bin"
+                    export PATH="\$TOOLS_DIR/bin:\$TOOLS_DIR/node/bin:\$TOOLS_DIR/sonar-scanner/bin:\$PATH"
+
+                    # 1. Ensure Node.js is available (required by SonarQube JS/TS analyzer)
+                    if ! command -v node >/dev/null 2>&1; then
+                        echo "--> Node.js not found in PATH. Downloading portable Node.js v20 for SonarJS..."
+                        ARCH=\$(uname -m)
+                        NODE_ARCH="x64"
+                        if [ "\$ARCH" = "aarch64" ] || [ "\$ARCH" = "arm64" ]; then NODE_ARCH="arm64"; fi
+                        mkdir -p "\$TOOLS_DIR/node"
+                        curl -fsSL "https://nodejs.org/dist/v20.18.0/node-v20.18.0-linux-\${NODE_ARCH}.tar.gz" | tar -xz -C "\$TOOLS_DIR/node" --strip-components=1
                     fi
+                    echo "--> Using Node.js: \$(node -v)"
+
+                    # 2. Ensure sonar-scanner CLI is available (uses Jenkins built-in Java runtime)
+                    if ! command -v sonar-scanner >/dev/null 2>&1; then
+                        echo "--> sonar-scanner not found in PATH. Downloading standalone sonar-scanner-cli..."
+                        SONAR_VER="5.0.1.3006"
+                        rm -rf "\$TOOLS_DIR/sonar-scanner" "/tmp/sonar-scanner.zip"
+                        curl -fsSL "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-\${SONAR_VER}.zip" -o "/tmp/sonar-scanner.zip"
+                        mkdir -p "\$TOOLS_DIR/sonar-tmp"
+                        if command -v unzip >/dev/null 2>&1; then
+                            unzip -q "/tmp/sonar-scanner.zip" -d "\$TOOLS_DIR/sonar-tmp"
+                        else
+                            (cd "\$TOOLS_DIR/sonar-tmp" && jar xf "/tmp/sonar-scanner.zip")
+                        fi
+                        mv "\$TOOLS_DIR/sonar-tmp/sonar-scanner-\${SONAR_VER}" "\$TOOLS_DIR/sonar-scanner"
+                        rm -rf "\$TOOLS_DIR/sonar-tmp" "/tmp/sonar-scanner.zip"
+                        chmod +x "\$TOOLS_DIR/sonar-scanner/bin/sonar-scanner"
+                    fi
+
+                    echo "--> Running sonar-scanner..."
+                    sonar-scanner \\
+                        -Dsonar.host.url="${TARGET_SONAR_HOST}" \\
+                        -Dsonar.token="${TARGET_SONAR_TOKEN}" \\
+                        -Dsonar.projectKey="${TARGET_SONAR_KEY}"
                 """
             }
         }
@@ -221,7 +240,30 @@ pipeline {
                 echo "Building Docker image: ${IMAGE_NAME}:${BUILD_NUMBER}"
                 echo "=========================================="
                 sh """
-                    docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} -t ${IMAGE_NAME}:latest .
+                    set -e
+                    TOOLS_DIR="\$HOME/.local"
+                    mkdir -p "\$TOOLS_DIR/bin"
+                    export PATH="\$TOOLS_DIR/bin:\$PATH"
+
+                    # Ensure docker CLI binary is present if docker.sock exists
+                    if ! command -v docker >/dev/null 2>&1 && [ -S /var/run/docker.sock ]; then
+                        echo "--> Docker socket detected but docker CLI missing. Downloading static Docker CLI..."
+                        ARCH=\$(uname -m)
+                        DOCKER_ARCH="x86_64"
+                        if [ "\$ARCH" = "aarch64" ] || [ "\$ARCH" = "arm64" ]; then DOCKER_ARCH="aarch64"; fi
+                        (curl -fsSL "https://download.docker.com/linux/static/stable/\${DOCKER_ARCH}/docker-27.3.1.tgz" | tar -xz -C "\$TOOLS_DIR/bin" --strip-components=1 docker/docker && chmod +x "\$TOOLS_DIR/bin/docker") || true
+                    fi
+
+                    # Check if local Docker daemon is accessible on Jenkins agent
+                    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+                        echo "--> Local Docker daemon is available on Jenkins agent. Building image locally..."
+                        echo "LOCAL_IMAGE" > .build_mode
+                        docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} -t ${IMAGE_NAME}:latest .
+                    else
+                        echo "--> [NOTICE] Local Docker daemon is not accessible inside this Jenkins agent."
+                        echo "--> Switching to REMOTE_BUILD mode: Docker image will be built directly on ${TARGET_USER}@${TARGET_IP}."
+                        echo "REMOTE_BUILD" > .build_mode
+                    fi
                 """
             }
         }
@@ -229,11 +271,27 @@ pipeline {
         stage('Archive Image for Transfer') {
             steps {
                 echo "=========================================="
-                echo "Saving Docker image to archive: ${IMAGE_ARCHIVE}"
+                echo "Preparing archive for transfer: ${IMAGE_ARCHIVE}"
                 echo "=========================================="
                 sh """
-                    docker save ${IMAGE_NAME}:latest | gzip > ${IMAGE_ARCHIVE}
-                    ls -lh ${IMAGE_ARCHIVE}
+                    set -e
+                    export PATH="\$HOME/.local/bin:\$PATH"
+                    BUILD_MODE=\$(cat .build_mode 2>/dev/null || echo "REMOTE_BUILD")
+
+                    if [ "\$BUILD_MODE" = "LOCAL_IMAGE" ]; then
+                        echo "--> Saving compiled Docker image to ${IMAGE_ARCHIVE}..."
+                        docker save ${IMAGE_NAME}:latest | gzip > "${IMAGE_ARCHIVE}"
+                    else
+                        echo "--> Packaging application source code into ${IMAGE_ARCHIVE} for remote Docker build..."
+                        tar --exclude='./.git' \\
+                            --exclude='./.env' \\
+                            --exclude='./.build_mode' \\
+                            --exclude='./node_modules' \\
+                            --exclude='./.next' \\
+                            --exclude="./${IMAGE_ARCHIVE}" \\
+                            -czf "${IMAGE_ARCHIVE}" .
+                    fi
+                    ls -lh "${IMAGE_ARCHIVE}"
                 """
             }
         }
@@ -246,38 +304,66 @@ pipeline {
                 echo "=========================================="
 
                 sh """
-                    # Ensure sshpass and openssh-client are installed on Jenkins agent
-                    if ! command -v sshpass >/dev/null 2>&1; then
-                        echo "sshpass not found. Attempting installation on Jenkins runner..."
-                        if command -v apt-get >/dev/null 2>&1; then
-                            apt-get update && apt-get install -y sshpass openssh-client
-                        elif command -v apk >/dev/null 2>&1; then
-                            apk add --no-cache sshpass openssh-client
-                        elif command -v yum >/dev/null 2>&1; then
-                            yum install -y sshpass openssh-clients
-                        else
-                            echo "ERROR: Please install 'sshpass' on your Jenkins agent machine."
-                            exit 1
-                        fi
-                    fi
+                    set -e
+                    export PATH="\$HOME/.local/bin:\$PATH"
+                    BUILD_MODE=\$(cat .build_mode 2>/dev/null || echo "REMOTE_BUILD")
 
-                    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+                    # Configure zero-privilege SSH password helper (works with or without sshpass / root)
+                    ASKPASS_SCRIPT="/tmp/jenkins_askpass_\$\$.sh"
+                    trap 'rm -f "\$ASKPASS_SCRIPT"' EXIT
+                    cat << 'EOF' > "\$ASKPASS_SCRIPT"
+#!/bin/sh
+echo "\$SSHPASS"
+EOF
+                    chmod 700 "\$ASKPASS_SCRIPT"
+                    export SSH_ASKPASS="\$ASKPASS_SCRIPT"
+                    export SSH_ASKPASS_REQUIRE=force
+                    export DISPLAY=:0
+
+                    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"
+
+                    run_ssh() {
+                        if command -v sshpass >/dev/null 2>&1; then
+                            sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "\$@"
+                        else
+                            ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "\$@"
+                        fi
+                    }
+
+                    run_scp() {
+                        if command -v sshpass >/dev/null 2>&1; then
+                            sshpass -e scp \$SSH_OPTS -P "${TARGET_PORT}" "\$@"
+                        else
+                            scp \$SSH_OPTS -P "${TARGET_PORT}" "\$@"
+                        fi
+                    }
 
                     echo "1. Testing SSH connectivity to ${TARGET_USER}@${TARGET_IP}..."
-                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "echo 'SSH connection successful! Remote host:' \$(hostname)"
+                    run_ssh "echo 'SSH connection successful! Remote host:' \$(hostname)"
 
                     echo "2. Checking Docker availability on remote server..."
-                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "docker --version || { echo 'Docker is not installed or not running on remote server!'; exit 1; }"
+                    run_ssh "docker --version || { echo 'Docker is not installed or not running on remote server!'; exit 1; }"
 
-                    echo "3. Transferring compressed Docker image to /tmp on remote server..."
-                    sshpass -e scp \$SSH_OPTS -P "${TARGET_PORT}" "${IMAGE_ARCHIVE}" "${TARGET_USER}@${TARGET_IP}:/tmp/${IMAGE_ARCHIVE}"
+                    echo "3. Transferring ${IMAGE_ARCHIVE} to /tmp on remote server..."
+                    run_scp "${IMAGE_ARCHIVE}" "${TARGET_USER}@${TARGET_IP}:/tmp/${IMAGE_ARCHIVE}"
 
-                    echo "4. Loading Docker image and restarting container on remote server..."
-                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "
+                    echo "4. Deploying Docker image and restarting container on remote server (Mode: \$BUILD_MODE)..."
+                    run_ssh "
                         set -e
-                        echo '--> Loading image from /tmp/${IMAGE_ARCHIVE}...'
-                        docker load -i /tmp/${IMAGE_ARCHIVE}
-                        rm -f /tmp/${IMAGE_ARCHIVE}
+                        if [ '\$BUILD_MODE' = 'LOCAL_IMAGE' ]; then
+                            echo '--> Loading pre-built Docker image from /tmp/${IMAGE_ARCHIVE}...'
+                            docker load -i /tmp/${IMAGE_ARCHIVE}
+                            rm -f /tmp/${IMAGE_ARCHIVE}
+                        else
+                            echo '--> Extracting source archive and building Docker image on remote server...'
+                            BUILD_DIR=/tmp/build-${CONTAINER_NAME}-${BUILD_NUMBER}
+                            rm -rf \\\$BUILD_DIR
+                            mkdir -p \\\$BUILD_DIR
+                            tar -xzf /tmp/${IMAGE_ARCHIVE} -C \\\$BUILD_DIR
+                            rm -f /tmp/${IMAGE_ARCHIVE}
+                            docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} -t ${IMAGE_NAME}:latest \\\$BUILD_DIR
+                            rm -rf \\\$BUILD_DIR
+                        fi
 
                         echo '--> Stopping and removing old container if exists...'
                         docker stop ${CONTAINER_NAME} 2>/dev/null || true
@@ -303,13 +389,35 @@ pipeline {
                 echo "Verifying container status and HTTP response"
                 echo "=========================================="
                 sh """
-                    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+                    set -e
+                    export PATH="\$HOME/.local/bin:\$PATH"
+
+                    ASKPASS_SCRIPT="/tmp/jenkins_askpass_\$\$.sh"
+                    trap 'rm -f "\$ASKPASS_SCRIPT"' EXIT
+                    cat << 'EOF' > "\$ASKPASS_SCRIPT"
+#!/bin/sh
+echo "\$SSHPASS"
+EOF
+                    chmod 700 "\$ASKPASS_SCRIPT"
+                    export SSH_ASKPASS="\$ASKPASS_SCRIPT"
+                    export SSH_ASKPASS_REQUIRE=force
+                    export DISPLAY=:0
+
+                    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"
+
+                    run_ssh() {
+                        if command -v sshpass >/dev/null 2>&1; then
+                            sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "\$@"
+                        else
+                            ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "\$@"
+                        fi
+                    }
                     
                     echo "1. Checking container running status:"
-                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "docker ps --filter 'name=${CONTAINER_NAME}' --format 'table {{.ID}}\\t{{.Names}}\\t{{.Status}}\\t{{.Ports}}'"
+                    run_ssh "docker ps --filter 'name=${CONTAINER_NAME}' --format 'table {{.ID}}\\t{{.Names}}\\t{{.Status}}\\t{{.Ports}}'"
                     
                     echo "2. Polling HTTP health check on port ${TARGET_APP_PORT} (up to 30 seconds)..."
-                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "
+                    run_ssh "
                         for i in \$(seq 1 15); do
                             HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${TARGET_APP_PORT} || true)
                             if [ \"\$HTTP_CODE\" = \"200\" ] || [ \"\$HTTP_CODE\" = \"304\" ]; then
@@ -330,7 +438,7 @@ pipeline {
     post {
         always {
             echo "--> [CLEANUP] Cleaning temporary image archives and workspace secrets..."
-            sh "rm -f ${IMAGE_ARCHIVE} .env || true"
+            sh "rm -f ${IMAGE_ARCHIVE} .env .build_mode || true"
         }
         success {
             echo "=========================================================================="
