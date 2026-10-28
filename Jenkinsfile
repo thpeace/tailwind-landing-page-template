@@ -68,8 +68,8 @@ pipeline {
         )
         string(
             name: 'SONAR_PROJECT_KEY',
-            defaultValue: 'simple-next-app', 
-            description: 'SonarQube Project Key'
+            defaultValue: '', 
+            description: 'SonarQube Project Key (Leave blank to use SONAR_PROJECT_KEY from .env, default simple-next-app)'
         )
     }
 
@@ -104,12 +104,12 @@ pipeline {
             steps {
                 script {
                     // 1. Try to fetch .env from Jenkins Secret File credential
-                    def credId = (params.ENV_CREDENTIAL_ID?.trim()) ? params.ENV_CREDENTIAL_ID.trim() : 'app-env-file-web'
+                    def credId = (params.ENV_CREDENTIAL_ID?.trim()) ? params.ENV_CREDENTIAL_ID.trim() : 'app-env-file'
                     try {
                         withCredentials([file(credentialsId: credId, variable: 'SECRET_ENV_FILE')]) {
                             if (fileExists(SECRET_ENV_FILE)) {
                                 echo "--> [SECRET FILE] Injected .env from Jenkins Credential ID: '${credId}'"
-                                sh "cp '${SECRET_ENV_FILE}' .env"
+                                sh 'cp "$SECRET_ENV_FILE" .env'
                             }
                         }
                     } catch (Exception e) {
@@ -117,48 +117,65 @@ pipeline {
                     }
 
                     // 2. Check if local .env file exists in the workspace
+                    def dotenv = [:]
                     if (fileExists('.env')) {
                         echo "--> Found .env file in workspace. Loading server credentials..."
-                        def envFileContent = readFile('.env')
-                        envFileContent.split("\n").each { rawLine ->
-                            def line = rawLine.trim()
+                        def envFileContent = readFile('.env').replace('\uFEFF', '')
+                        def lines = envFileContent.split('\\r?\\n')
+                        for (int i = 0; i < lines.length; i++) {
+                            def line = lines[i].trim()
                             if (line && !line.startsWith('#') && line.contains('=')) {
-                                def parts = line.split('=', 2)
-                                def key = parts[0].trim()
-                                def val = parts[1].trim()
-                                if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                                int eqIdx = line.indexOf('=')
+                                def key = line.substring(0, eqIdx).trim()
+                                def val = line.substring(eqIdx + 1).trim()
+                                if (val.length() >= 2 && ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))) {
                                     val = val.substring(1, val.length() - 1)
                                 }
-                                env."${key}" = val
+                                dotenv[key] = val
+                                env[key] = val
                             }
                         }
+                        echo "--> Loaded ${dotenv.size()} configuration keys from .env: ${dotenv.keySet().join(', ')}"
                     } else {
                         echo "--> Notice: No .env file found in workspace. Using parameters/environment."
                     }
 
-                    // Resolve final target variables with priority: parameter (if filled) > .env > default
-                    env.TARGET_IP          = (params.SERVER_IP?.trim()) ? params.SERVER_IP.trim() : (env.SERVER_IP ?: '')
-                    env.TARGET_PORT        = (params.SERVER_PORT?.trim()) ? params.SERVER_PORT.trim() : (env.SERVER_PORT ?: '22')
-                    env.TARGET_USER        = (params.SERVER_USER?.trim()) ? params.SERVER_USER.trim() : (env.SERVER_USER ?: 'root')
-                    env.TARGET_PASS        = (params.SERVER_PASSWORD) ? params.SERVER_PASSWORD : (env.SERVER_PASSWORD ?: '')
-                    env.TARGET_APP_PORT    = (params.APP_PORT?.trim()) ? params.APP_PORT.trim() : (env.APP_PORT ?: '3000')
+                    // Safely extract build parameters (note: Jenkins password() parameters return hudson.util.Secret,
+                    // which is always truthy as an object even when empty, so convert via .toString() before checking)
+                    def paramIp         = params.SERVER_IP ? params.SERVER_IP.toString().trim() : ''
+                    def paramPort       = params.SERVER_PORT ? params.SERVER_PORT.toString().trim() : ''
+                    def paramUser       = params.SERVER_USER ? params.SERVER_USER.toString().trim() : ''
+                    def paramPass       = params.SERVER_PASSWORD ? params.SERVER_PASSWORD.toString().trim() : ''
+                    def paramAppPort    = params.APP_PORT ? params.APP_PORT.toString().trim() : ''
+                    def paramSonarHost  = params.SONAR_HOST_URL ? params.SONAR_HOST_URL.toString().trim() : ''
+                    def paramSonarToken = params.SONAR_TOKEN ? params.SONAR_TOKEN.toString().trim() : ''
+                    def paramSonarKey   = params.SONAR_PROJECT_KEY ? params.SONAR_PROJECT_KEY.toString().trim() : ''
 
-                    env.TARGET_SONAR_HOST  = (params.SONAR_HOST_URL?.trim()) ? params.SONAR_HOST_URL.trim() : (env.SONAR_HOST_URL ?: '')
-                    env.TARGET_SONAR_TOKEN = (params.SONAR_TOKEN) ? params.SONAR_TOKEN : (env.SONAR_TOKEN ?: '')
-                    env.TARGET_SONAR_KEY   = (params.SONAR_PROJECT_KEY?.trim()) ? params.SONAR_PROJECT_KEY.trim() : (env.SONAR_PROJECT_KEY ?: 'simple-next-app')
+                    // Resolve final target variables with priority: parameter (if filled) > .env > default
+                    env.TARGET_IP          = paramIp ?: (dotenv['SERVER_IP'] ?: (env.SERVER_IP ?: ''))
+                    env.TARGET_PORT        = paramPort ?: (dotenv['SERVER_PORT'] ?: (env.SERVER_PORT ?: '22'))
+                    env.TARGET_USER        = paramUser ?: (dotenv['SERVER_USER'] ?: (env.SERVER_USER ?: 'root'))
+                    env.TARGET_PASS        = paramPass ?: (dotenv['SERVER_PASSWORD'] ?: (env.SERVER_PASSWORD ?: ''))
+                    env.SSHPASS            = env.TARGET_PASS
+                    env.TARGET_APP_PORT    = paramAppPort ?: (dotenv['APP_PORT'] ?: (env.APP_PORT ?: '3000'))
+
+                    env.TARGET_SONAR_HOST  = paramSonarHost ?: (dotenv['SONAR_HOST_URL'] ?: (env.SONAR_HOST_URL ?: ''))
+                    env.TARGET_SONAR_TOKEN = paramSonarToken ?: (dotenv['SONAR_TOKEN'] ?: (env.SONAR_TOKEN ?: ''))
+                    env.TARGET_SONAR_KEY   = (paramSonarKey && paramSonarKey != 'simple-next-app') ? paramSonarKey : (dotenv['SONAR_PROJECT_KEY'] ?: (paramSonarKey ?: 'simple-next-app'))
                     
                     def enableSonarParam = params.ENABLE_SONAR_SCAN != null ? params.ENABLE_SONAR_SCAN : true
-                    env.SHOULD_SCAN_SONAR  = (env.ENABLE_SONAR_SCAN != null ? env.ENABLE_SONAR_SCAN.toBoolean() : enableSonarParam).toString()
+                    def dotenvSonar = dotenv['ENABLE_SONAR_SCAN'] != null ? dotenv['ENABLE_SONAR_SCAN'] : env.ENABLE_SONAR_SCAN
+                    env.SHOULD_SCAN_SONAR  = (dotenvSonar != null ? dotenvSonar.toString().toBoolean() : enableSonarParam).toString()
 
                     // Validate that deployment targets are available
                     if (!env.TARGET_IP || !env.TARGET_USER || !env.TARGET_PASS) {
-                        error("CRITICAL: Missing server credentials! Please ensure .env exists with SERVER_IP, SERVER_USER, and SERVER_PASSWORD, or supply them as build parameters.")
+                        error("CRITICAL: Missing server credentials! Resolved TARGET_IP='${env.TARGET_IP}', TARGET_USER='${env.TARGET_USER}', TARGET_PASS_SET=${env.TARGET_PASS ? 'true' : 'false'}. Please ensure .env exists with SERVER_IP, SERVER_USER, and SERVER_PASSWORD, or supply them as build parameters.")
                     }
 
                     echo "Configuration resolved:"
-                    echo "  - Linux Server: ${TARGET_USER}@${TARGET_IP}:${TARGET_PORT}"
-                    echo "  - Target Port : ${TARGET_APP_PORT}"
-                    echo "  - SonarQube   : ${TARGET_SONAR_HOST ? TARGET_SONAR_HOST : 'Disabled/Not configured'}"
+                    echo "  - Linux Server: ${env.TARGET_USER}@${env.TARGET_IP}:${env.TARGET_PORT}"
+                    echo "  - Target Port : ${env.TARGET_APP_PORT}"
+                    echo "  - SonarQube   : ${env.TARGET_SONAR_HOST ? env.TARGET_SONAR_HOST + ' (Project: ' + env.TARGET_SONAR_KEY + ')' : 'Disabled/Not configured'}"
                 }
             }
         }
@@ -245,20 +262,19 @@ pipeline {
                         fi
                     fi
 
-                    SSH_CMD="sshpass -p '${TARGET_PASS}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${TARGET_PORT}"
-                    SCP_CMD="sshpass -p '${TARGET_PASS}' scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P ${TARGET_PORT}"
+                    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
                     echo "1. Testing SSH connectivity to ${TARGET_USER}@${TARGET_IP}..."
-                    \$SSH_CMD ${TARGET_USER}@${TARGET_IP} "echo 'SSH connection successful! Remote host:' \$(hostname)"
+                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "echo 'SSH connection successful! Remote host:' \$(hostname)"
 
                     echo "2. Checking Docker availability on remote server..."
-                    \$SSH_CMD ${TARGET_USER}@${TARGET_IP} "docker --version || { echo 'Docker is not installed or not running on remote server!'; exit 1; }"
+                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "docker --version || { echo 'Docker is not installed or not running on remote server!'; exit 1; }"
 
                     echo "3. Transferring compressed Docker image to /tmp on remote server..."
-                    \$SCP_CMD ${IMAGE_ARCHIVE} ${TARGET_USER}@${TARGET_IP}:/tmp/${IMAGE_ARCHIVE}
+                    sshpass -e scp \$SSH_OPTS -P "${TARGET_PORT}" "${IMAGE_ARCHIVE}" "${TARGET_USER}@${TARGET_IP}:/tmp/${IMAGE_ARCHIVE}"
 
                     echo "4. Loading Docker image and restarting container on remote server..."
-                    \$SSH_CMD ${TARGET_USER}@${TARGET_IP} "
+                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "
                         set -e
                         echo '--> Loading image from /tmp/${IMAGE_ARCHIVE}...'
                         docker load -i /tmp/${IMAGE_ARCHIVE}
@@ -288,13 +304,13 @@ pipeline {
                 echo "Verifying container status and HTTP response"
                 echo "=========================================="
                 sh """
-                    SSH_CMD="sshpass -p '${TARGET_PASS}' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${TARGET_PORT}"
+                    SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
                     
                     echo "1. Checking container running status:"
-                    \$SSH_CMD ${TARGET_USER}@${TARGET_IP} "docker ps --filter 'name=${CONTAINER_NAME}' --format 'table {{.ID}}\\t{{.Names}}\\t{{.Status}}\\t{{.Ports}}'"
+                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "docker ps --filter 'name=${CONTAINER_NAME}' --format 'table {{.ID}}\\t{{.Names}}\\t{{.Status}}\\t{{.Ports}}'"
                     
                     echo "2. Polling HTTP health check on port ${TARGET_APP_PORT} (up to 30 seconds)..."
-                    \$SSH_CMD ${TARGET_USER}@${TARGET_IP} "
+                    sshpass -e ssh \$SSH_OPTS -p "${TARGET_PORT}" "${TARGET_USER}@${TARGET_IP}" "
                         for i in \$(seq 1 15); do
                             HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${TARGET_APP_PORT} || true)
                             if [ \"\$HTTP_CODE\" = \"200\" ] || [ \"\$HTTP_CODE\" = \"304\" ]; then
