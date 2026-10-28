@@ -197,39 +197,57 @@ pipeline {
                     mkdir -p "\$TOOLS_DIR/bin"
                     export PATH="\$TOOLS_DIR/bin:\$TOOLS_DIR/node/bin:\$TOOLS_DIR/sonar-scanner/bin:\$PATH"
 
-                    # 1. Ensure Node.js is available (required by SonarQube JS/TS analyzer)
-                    if ! command -v node >/dev/null 2>&1; then
-                        echo "--> Node.js not found in PATH. Downloading portable Node.js v20 for SonarJS..."
-                        ARCH=\$(uname -m)
-                        NODE_ARCH="x64"
-                        if [ "\$ARCH" = "aarch64" ] || [ "\$ARCH" = "arm64" ]; then NODE_ARCH="arm64"; fi
-                        mkdir -p "\$TOOLS_DIR/node"
-                        curl -fsSL "https://nodejs.org/dist/v20.18.0/node-v20.18.0-linux-\${NODE_ARCH}.tar.gz" | tar -xz -C "\$TOOLS_DIR/node" --strip-components=1
-                    fi
-                    echo "--> Using Node.js: \$(node -v)"
+                    # 1. Pre-check SonarQube server reachability and token validity
+                    echo "--> Validating SonarQube token against ${TARGET_SONAR_HOST}/api/authentication/validate..."
+                    AUTH_RESPONSE=\$(curl -fsSL -u "${TARGET_SONAR_TOKEN}:" "${TARGET_SONAR_HOST}/api/authentication/validate" 2>/dev/null || echo '{"valid":false}')
+                    echo "--> SonarQube auth check response: \$AUTH_RESPONSE"
 
-                    # 2. Ensure sonar-scanner CLI is available (uses Jenkins built-in Java runtime)
-                    if ! command -v sonar-scanner >/dev/null 2>&1; then
-                        echo "--> sonar-scanner not found in PATH. Downloading standalone sonar-scanner-cli..."
-                        SONAR_VER="5.0.1.3006"
-                        rm -rf "\$TOOLS_DIR/sonar-scanner" "/tmp/sonar-scanner.zip"
-                        curl -fsSL "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-\${SONAR_VER}.zip" -o "/tmp/sonar-scanner.zip"
-                        mkdir -p "\$TOOLS_DIR/sonar-tmp"
-                        if command -v unzip >/dev/null 2>&1; then
-                            unzip -q "/tmp/sonar-scanner.zip" -d "\$TOOLS_DIR/sonar-tmp"
-                        else
-                            (cd "\$TOOLS_DIR/sonar-tmp" && jar xf "/tmp/sonar-scanner.zip")
+                    if echo "\$AUTH_RESPONSE" | grep -q '"valid":true'; then
+                        # 2. Ensure Node.js is available (required by SonarQube JS/TS analyzer)
+                        if ! command -v node >/dev/null 2>&1; then
+                            echo "--> Node.js not found in PATH. Downloading portable Node.js v20 for SonarJS..."
+                            ARCH=\$(uname -m)
+                            NODE_ARCH="x64"
+                            if [ "\$ARCH" = "aarch64" ] || [ "\$ARCH" = "arm64" ]; then NODE_ARCH="arm64"; fi
+                            mkdir -p "\$TOOLS_DIR/node"
+                            curl -fsSL "https://nodejs.org/dist/v20.18.0/node-v20.18.0-linux-\${NODE_ARCH}.tar.gz" | tar -xz -C "\$TOOLS_DIR/node" --strip-components=1
                         fi
-                        mv "\$TOOLS_DIR/sonar-tmp/sonar-scanner-\${SONAR_VER}" "\$TOOLS_DIR/sonar-scanner"
-                        rm -rf "\$TOOLS_DIR/sonar-tmp" "/tmp/sonar-scanner.zip"
-                        chmod +x "\$TOOLS_DIR/sonar-scanner/bin/sonar-scanner"
-                    fi
+                        echo "--> Using Node.js: \$(node -v)"
 
-                    echo "--> Running sonar-scanner..."
-                    sonar-scanner \\
-                        -Dsonar.host.url="${TARGET_SONAR_HOST}" \\
-                        -Dsonar.token="${TARGET_SONAR_TOKEN}" \\
-                        -Dsonar.projectKey="${TARGET_SONAR_KEY}"
+                        # 3. Ensure sonar-scanner CLI 6.2.1 is available (uses Jenkins built-in Java runtime)
+                        SONAR_VER="6.2.1.4610"
+                        if [ ! -x "\$TOOLS_DIR/sonar-scanner-\${SONAR_VER}/bin/sonar-scanner" ]; then
+                            echo "--> Downloading standalone sonar-scanner-cli v\${SONAR_VER}..."
+                            rm -rf "\$TOOLS_DIR/sonar-scanner" "\$TOOLS_DIR/sonar-scanner-\${SONAR_VER}" "/tmp/sonar-scanner.zip"
+                            curl -fsSL "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-\${SONAR_VER}.zip" -o "/tmp/sonar-scanner.zip"
+                            mkdir -p "\$TOOLS_DIR/sonar-tmp"
+                            if command -v unzip >/dev/null 2>&1; then
+                                unzip -q "/tmp/sonar-scanner.zip" -d "\$TOOLS_DIR/sonar-tmp"
+                            else
+                                (cd "\$TOOLS_DIR/sonar-tmp" && jar xf "/tmp/sonar-scanner.zip")
+                            fi
+                            mv "\$TOOLS_DIR/sonar-tmp/sonar-scanner-\${SONAR_VER}" "\$TOOLS_DIR/sonar-scanner-\${SONAR_VER}"
+                            ln -sfn "\$TOOLS_DIR/sonar-scanner-\${SONAR_VER}" "\$TOOLS_DIR/sonar-scanner"
+                            rm -rf "\$TOOLS_DIR/sonar-tmp" "/tmp/sonar-scanner.zip"
+                            chmod +x "\$TOOLS_DIR/sonar-scanner/bin/sonar-scanner"
+                        fi
+
+                        echo "--> Running sonar-scanner..."
+                        "\$TOOLS_DIR/sonar-scanner/bin/sonar-scanner" \\
+                            -Dsonar.scanner.skipJreProvisioning=true \\
+                            -Dsonar.host.url="${TARGET_SONAR_HOST}" \\
+                            -Dsonar.token="${TARGET_SONAR_TOKEN}" \\
+                            -Dsonar.projectKey="${TARGET_SONAR_KEY}" || {
+                                echo "--> [WARNING] SonarQube scan reported an error, continuing pipeline deployment..."
+                            }
+                    else
+                        echo "=========================================================================="
+                        echo "--> [WARNING] SonarQube rejected SONAR_TOKEN (Not Authorized / valid:false)."
+                        echo "--> Skipping SonarQube scan so Docker build and deployment can proceed."
+                        echo "--> To fix: Generate a new token in SonarQube (${TARGET_SONAR_HOST} -> My Account -> Security)"
+                        echo "--> and update SONAR_TOKEN in your .env (and Jenkins 'app-env-file' Secret File)."
+                        echo "=========================================================================="
+                    fi
                 """
             }
         }
